@@ -63,11 +63,19 @@ _announce_count = 0             # running count of announces received
 def db_init():
     """Create tables if they don't exist yet."""
     with sqlite3.connect(str(DB_PATH)) as c:
+        # Migrate from old schema: hash was dest-hash + single app_type
+        # New schema uses identity-hash + JSON app_types list, so drop old data
+        cur = c.execute("PRAGMA table_info(nodes)")
+        cols = {row[1] for row in cur.fetchall()}
+        if cols and 'app_types' not in cols:
+            c.execute("DROP TABLE IF EXISTS nodes")
+            print("[rns-map] Migrated nodes table to new schema (identity-hash + app_types)", flush=True)
+
         c.execute("""
             CREATE TABLE IF NOT EXISTS nodes (
                 hash       TEXT PRIMARY KEY,
                 name       TEXT,
-                app_type   TEXT,
+                app_types  TEXT,
                 hops       INTEGER,
                 first_seen REAL,
                 last_seen  REAL
@@ -87,12 +95,12 @@ def db_load():
     """Load all persisted nodes into the in-memory cache on startup."""
     with sqlite3.connect(str(DB_PATH)) as c:
         for row in c.execute(
-            "SELECT hash, name, app_type, hops, first_seen, last_seen FROM nodes"
+            "SELECT hash, name, app_types, hops, first_seen, last_seen FROM nodes"
         ):
             _nodes[row[0]] = {
                 "hash":       row[0],
                 "name":       row[1],
-                "app_type":   row[2],
+                "app_types":  json.loads(row[2]),
                 "hops":       row[3],
                 "first_seen": row[4],
                 "last_seen":  row[5],
@@ -114,10 +122,11 @@ def _db_worker():
                 node = op[1]
                 conn.execute("""
                     INSERT OR REPLACE INTO nodes
-                    (hash, name, app_type, hops, first_seen, last_seen)
+                    (hash, name, app_types, hops, first_seen, last_seen)
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (
-                    node["hash"], node["name"], node["app_type"],
+                    node["hash"], node["name"],
+                    json.dumps(node["app_types"]),
                     node["hops"], node["first_seen"], node["last_seen"],
                 ))
                 conn.commit()
@@ -243,35 +252,58 @@ def _process(app_type: str, destination_hash: bytes, announced_identity,
     Called by each announce handler. Builds a node dict, updates the
     in-memory cache and SQLite, then fires a WebSocket broadcast.
     Runs on the RNS announce thread (not the asyncio loop thread).
+
+    Nodes are keyed by identity hash so that a single physical node
+    announcing on multiple aspects (e.g. lxmf + nomadnet) appears once
+    with a merged app_types list.
     """
     global _announce_count
     try:
-        hash_hex  = destination_hash.hex()
+        dest_hex  = destination_hash.hex()
+        # Use identity hash to group capabilities from the same node
+        if announced_identity and hasattr(announced_identity, 'hash') and announced_identity.hash:
+            id_hash = announced_identity.hash.hex()
+        else:
+            id_hash = dest_hex
+
         now       = time.time()
-        name      = _parse_name(app_data, hash_hex[:12])
+        name      = _parse_name(app_data, id_hash[:12])
         hops      = min(max(_get_hops(destination_hash,
                             kwargs.get("announce_packet_hash")), 0), 6)
         _announce_count += 1
 
-        node = {
-            "hash":       hash_hex,
-            "name":       name,
-            "app_type":   app_type,
-            "hops":       hops,
-            # Preserve first_seen from existing record if the node is known
-            "first_seen": _nodes.get(hash_hex, {}).get("first_seen", now),
-            "last_seen":  now,
-        }
-        _nodes[hash_hex] = node
+        existing = _nodes.get(id_hash)
+        if existing:
+            # Merge new capability into existing node
+            if app_type not in existing["app_types"]:
+                existing["app_types"].append(app_type)
+                existing["app_types"].sort()
+            existing["last_seen"] = now
+            existing["hops"] = min(existing["hops"], hops)
+            if name != id_hash[:12]:
+                existing["name"] = name
+            node = existing
+        else:
+            node = {
+                "hash":       id_hash,
+                "name":       name,
+                "app_types":  [app_type],
+                "hops":       hops,
+                "first_seen": now,
+                "last_seen":  now,
+            }
+            _nodes[id_hash] = node
 
         # Enqueue DB writes for the single persistent writer thread
         _db_queue.put(("upsert", dict(node)))
         _db_queue.put(("activity", app_type))
 
-        event = {"type": "announce", "node": dict(node), "ts": now}
+        event = {"type": "announce", "node": dict(node), "ts": now,
+                 "announce_type": app_type}
         loop_ok = _loop is not None and _loop.is_running()
-        print("[rns-map] #{} {} \"{}\" hops={} ws={}".format(
-            _announce_count, app_type, name, hops, len(_ws_clients)), flush=True)
+        print("[rns-map] #{} {} \"{}\" hops={} types={} ws={}".format(
+            _announce_count, app_type, name, hops,
+            ",".join(node["app_types"]), len(_ws_clients)), flush=True)
 
         if loop_ok:
             # Thread-safe bridge from RNS thread into the asyncio event loop
