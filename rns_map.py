@@ -23,6 +23,7 @@ HTTP + WebSocket served on PORT 8085:
 
 import asyncio
 import json
+import queue
 import sqlite3
 import threading
 import time
@@ -52,7 +53,7 @@ MAX_BUCKETS = 24 * 60       # Keep 24 hours of activity history
 _loop           = None          # asyncio event loop reference (set in main())
 _ws_clients     = set()         # currently connected WebSocket clients
 _nodes          = {}            # in-memory node cache: {hash_hex: node_dict}
-_db_lock        = threading.Lock()  # serialise SQLite writes from threads
+_db_queue       = queue.Queue() # queue for DB write operations
 _announce_count = 0             # running count of announces received
 
 # ---------------------------------------------------------------------------
@@ -97,37 +98,45 @@ def db_load():
                 "last_seen":  row[5],
             }
 
-def db_upsert_node(node):
-    """Insert or replace a node record. Called from a background thread."""
-    with _db_lock:
-        with sqlite3.connect(str(DB_PATH)) as c:
-            c.execute("""
-                INSERT OR REPLACE INTO nodes
-                (hash, name, app_type, hops, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                node["hash"], node["name"], node["app_type"],
-                node["hops"], node["first_seen"], node["last_seen"],
-            ))
-            c.commit()
-
-def db_record_activity(app_type: str):
+def _db_worker():
     """
-    Increment the announce counter for this app_type in the current
-    1-minute bucket, then prune buckets older than MAX_BUCKETS.
-    Called from a background thread.
+    Single persistent thread that drains _db_queue and writes to SQLite.
+    Uses one long-lived connection, avoiding file-descriptor exhaustion.
     """
-    bucket = int(time.time() // BUCKET_SECS) * BUCKET_SECS
-    with _db_lock:
-        with sqlite3.connect(str(DB_PATH)) as c:
-            c.execute("""
-                INSERT INTO activity (bucket_ts, app_type, count)
-                VALUES (?, ?, 1)
-                ON CONFLICT(bucket_ts, app_type) DO UPDATE SET count = count + 1
-            """, (bucket, app_type))
-            cutoff = bucket - MAX_BUCKETS * BUCKET_SECS
-            c.execute("DELETE FROM activity WHERE bucket_ts < ?", (cutoff,))
-            c.commit()
+    conn = sqlite3.connect(str(DB_PATH))
+    while True:
+        op = _db_queue.get()
+        if op is None:
+            break
+        try:
+            kind = op[0]
+            if kind == "upsert":
+                node = op[1]
+                conn.execute("""
+                    INSERT OR REPLACE INTO nodes
+                    (hash, name, app_type, hops, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    node["hash"], node["name"], node["app_type"],
+                    node["hops"], node["first_seen"], node["last_seen"],
+                ))
+                conn.commit()
+            elif kind == "activity":
+                app_type = op[1]
+                bucket = int(time.time() // BUCKET_SECS) * BUCKET_SECS
+                conn.execute("""
+                    INSERT INTO activity (bucket_ts, app_type, count)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(bucket_ts, app_type) DO UPDATE SET count = count + 1
+                """, (bucket, app_type))
+                cutoff = bucket - MAX_BUCKETS * BUCKET_SECS
+                conn.execute("DELETE FROM activity WHERE bucket_ts < ?", (cutoff,))
+                conn.commit()
+            elif kind == "reset":
+                conn.execute("DELETE FROM nodes")
+                conn.commit()
+        except Exception as e:
+            print("[rns-map] db_worker error: {}".format(e), flush=True)
 
 def db_get_activity():
     """
@@ -153,10 +162,7 @@ def db_get_activity():
 
 def db_reset_nodes():
     """Delete all rows from the nodes table."""
-    with _db_lock:
-        with sqlite3.connect(str(DB_PATH)) as c:
-            c.execute("DELETE FROM nodes")
-            c.commit()
+    _db_queue.put(("reset",))
 
 # ---------------------------------------------------------------------------
 # Name parsing
@@ -258,10 +264,9 @@ def _process(app_type: str, destination_hash: bytes, announced_identity,
         }
         _nodes[hash_hex] = node
 
-        # SQLite writes happen in background threads to avoid blocking the
-        # RNS announce thread
-        threading.Thread(target=db_upsert_node,    args=(dict(node),), daemon=True).start()
-        threading.Thread(target=db_record_activity, args=(app_type,),  daemon=True).start()
+        # Enqueue DB writes for the single persistent writer thread
+        _db_queue.put(("upsert", dict(node)))
+        _db_queue.put(("activity", app_type))
 
         event = {"type": "announce", "node": dict(node), "ts": now}
         loop_ok = _loop is not None and _loop.is_running()
@@ -394,6 +399,9 @@ async def main():
     db_init()
     db_load()
     print("[rns-map] Loaded {} nodes from DB".format(len(_nodes)), flush=True)
+
+    # Start a single persistent DB writer thread
+    threading.Thread(target=_db_worker, daemon=True).start()
 
     # Attach to the running rnsd as a shared-instance client.
     # RNS.Reticulum() with no arguments auto-discovers the rnsd socket.

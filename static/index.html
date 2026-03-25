@@ -6,6 +6,14 @@
 <title>RNS Live · vm150</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;500;700&display=swap">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
@@ -60,7 +68,7 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:v
 /* main — desktop: map fills all except right panel */
 #main { position:fixed; top:44px; left:0; right:310px; bottom:20px;
   display:flex; align-items:center; justify-content:center; overflow:hidden; }
-#dartboard { width:100%; height:100%; }
+#main canvas { display:block; }
 
 /* right panel — desktop: fixed sidebar */
 #panel { position:fixed; top:44px; right:0; bottom:20px; width:310px;
@@ -107,6 +115,10 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:v
 .tip-row { display:flex; justify-content:space-between; color:var(--muted); margin-top:4px; line-height:1.5; }
 .tip-row span:last-child { color:#78909c; text-align:right; max-width:130px; word-break:break-all; }
 
+/* CSS2D label styling */
+.node-label { font-family:'Share Tech Mono',monospace; font-size:10px; pointer-events:none; text-align:center; }
+.ring-label { font-family:'Share Tech Mono',monospace; font-size:11px; pointer-events:none; text-align:center; }
+
 /* ── Mobile layout ────────────────────────────────────────────────────────── */
 @media (max-width: 600px) {
   #main  { right: 0; bottom: calc(35vh); }
@@ -144,7 +156,7 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:v
   <span class="stat">announces <b id="na">0</b></span>
 </div>
 
-<div id="main"><svg id="dartboard" xmlns="http://www.w3.org/2000/svg"></svg></div>
+<div id="main"></div>
 
 <div id="panel">
   <div id="phdr">Live Announces</div>
@@ -158,7 +170,11 @@ html, body { height:100%; background:var(--bg); color:var(--text); font-family:v
 
 <div id="tip"></div>
 
-<script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
 // ── Palette ───────────────────────────────────────────────────────────────────
 const COL = { lxmf:'#00e5ff', nomadnet:'#69ff47', propagation:'#ff9100', audio:'#e040fb' };
 const LABEL = { lxmf:'LXMF', nomadnet:'Nomadnet', propagation:'Propagation', audio:'Audio' };
@@ -166,251 +182,508 @@ const MAX_RING = 3;
 const RING_F = [0, 0.38, 0.66, 0.90];
 const RING_NAMES = ['0 hops','1 hop','2 hops','3+ hops'];
 
+// ── 3D constants ──────────────────────────────────────────────────────────────
+const WORLD_R = 10;
+const FLOAT_Y = 0.3;
+const CENTER_Y = 0.4;
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let nodes = {};
 let filterOn = { lxmf:true, nomadnet:true, propagation:true, audio:true };
 let pktCount = 0;
-let CX=0, CY=0, R=0;
-const SVG_NS = 'http://www.w3.org/2000/svg';
-const svg = document.getElementById('dartboard');
-let lyrRings, lyrLines, lyrAnims, lyrNodes, lyrLabels;
 
-// ── SVG helpers ───────────────────────────────────────────────────────────────
-function el(tag, attrs) {
-  const e = document.createElementNS(SVG_NS, tag);
-  for (const [k,v] of Object.entries(attrs)) e.setAttribute(k, v);
-  return e;
-}
+// ── Three.js globals ──────────────────────────────────────────────────────────
+let scene, camera, renderer, labelRenderer, controls;
+const container = document.getElementById('main');
+const nodeMeshes = new Map();   // hash → {mesh, glow, label}
+const nodeGroup = [];           // flat array of node meshes for raycasting
+const activeAnims = [];
+const centerPulseRings = [];
+let isDragging = false;
 
-function initLayers() {
-  [lyrRings,lyrLines,lyrAnims,lyrNodes,lyrLabels].forEach(l => l && l.remove());
-  lyrRings  = el('g',{}); svg.appendChild(lyrRings);
-  lyrLines  = el('g',{}); svg.appendChild(lyrLines);
-  lyrAnims  = el('g',{}); svg.appendChild(lyrAnims);
-  lyrNodes  = el('g',{}); svg.appendChild(lyrNodes);
-  lyrLabels = el('g',{}); svg.appendChild(lyrLabels);
-}
+// Shared geometries
+const nodeGeo = new THREE.SphereGeometry(0.22, 16, 12);
+const glowGeo = new THREE.SphereGeometry(0.38, 16, 12);
+const dotGeo  = new THREE.SphereGeometry(0.1, 8, 6);
 
-// ── Sizing ────────────────────────────────────────────────────────────────────
-// On mobile: dartboard is slightly larger (R multiplier 0.50 vs 0.46)
-function resize() {
-  const m = document.getElementById('main');
-  const W = m.clientWidth, H = m.clientHeight;
-  svg.setAttribute('viewBox','0 0 '+W+' '+H);
-  svg.setAttribute('width', W); svg.setAttribute('height', H);
-  const mobile = window.innerWidth <= 600;
-  CX = W/2;
-  CY = H/2;
-  R  = Math.min(W,H) * (mobile ? 0.50 : 0.46);
-  redraw();
-}
+// ── Scene setup ───────────────────────────────────────────────────────────────
+function initScene() {
+  const W = container.clientWidth, H = container.clientHeight;
 
-// ── Draw rings ────────────────────────────────────────────────────────────────
-function drawRings() {
-  while (lyrRings.firstChild) lyrRings.removeChild(lyrRings.firstChild);
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x04080f);
 
-  let defs = svg.querySelector('defs');
-  if (!defs) { defs = el('defs',{}); svg.insertBefore(defs, svg.firstChild); }
-  defs.innerHTML =
-    '<radialGradient id="bggrad" cx="50%" cy="50%" r="50%">' +
-    '<stop offset="0%" stop-color="#0d1e2e" stop-opacity="1"/>' +
-    '<stop offset="100%" stop-color="#04080f" stop-opacity="1"/>' +
-    '</radialGradient>' +
-    '<filter id="glow-ctr"><feGaussianBlur stdDeviation="6" result="b"/>' +
-    '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>';
+  camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 100);
+  camera.position.set(0, 14, 10);
+  camera.lookAt(0, 0, 0);
 
-  lyrRings.appendChild(el('circle',{cx:CX,cy:CY,r:R*0.9,fill:'url(#bggrad)'}));
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(W, H);
+  container.appendChild(renderer.domElement);
 
-  for (let i = MAX_RING; i >= 1; i--) {
-    const r  = R * RING_F[i];
-    const alt = i % 2 === 0;
-    if (i > 1) {
-      lyrRings.appendChild(el('circle',{cx:CX,cy:CY,r:r,
-        fill: alt ? 'rgba(0,229,255,0.028)' : 'rgba(255,255,255,0.018)',
-        stroke:'none'}));
+  labelRenderer = new CSS2DRenderer();
+  labelRenderer.setSize(W, H);
+  labelRenderer.domElement.style.position = 'absolute';
+  labelRenderer.domElement.style.top = '0';
+  labelRenderer.domElement.style.left = '0';
+  labelRenderer.domElement.style.pointerEvents = 'none';
+  container.appendChild(labelRenderer.domElement);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.minPolarAngle = 0.1;
+  controls.maxPolarAngle = Math.PI / 2 - 0.05;
+  controls.minDistance = 4;
+  controls.maxDistance = 35;
+  controls.target.set(0, 0, 0);
+
+  controls.addEventListener('start', () => { isDragging = true; });
+  controls.addEventListener('end',   () => { isDragging = false; });
+
+  // Lighting
+  scene.add(new THREE.AmbientLight(0x556677, 2.0));
+  const dirLight = new THREE.DirectionalLight(0xaabbcc, 0.6);
+  dirLight.position.set(5, 10, 5);
+  scene.add(dirLight);
+
+  // Raycasting for tooltips
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+
+  renderer.domElement.addEventListener('mousemove', (e) => {
+    if (isDragging) { hideTip(); return; }
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    const hits = raycaster.intersectObjects(nodeGroup);
+    if (hits.length > 0) {
+      const hash = hits[0].object.userData.hash;
+      const n = nodes[hash];
+      if (n) showTip(n, e.clientX, e.clientY);
+    } else {
+      hideTip();
     }
-    lyrRings.appendChild(el('circle',{cx:CX,cy:CY,r:r,
-      fill:'none',
-      stroke: alt ? 'rgba(0,229,255,0.45)' : 'rgba(255,255,255,0.30)',
-      'stroke-width': alt ? 1.2 : 0.8,
-      'stroke-dasharray': alt ? '6 8' : '2 10'}));
+  });
+  renderer.domElement.addEventListener('mouseleave', hideTip);
+}
 
-    const txt = el('text',{x:CX,y:CY-r-5,fill: alt ? 'rgba(0,229,255,0.85)' : 'rgba(255,255,255,0.65)',
-      'font-family':'Share Tech Mono,monospace','font-size':'11',
-      'text-anchor':'middle','font-weight': alt ? 'bold' : 'normal'});
-    txt.textContent = RING_NAMES[i];
-    lyrRings.appendChild(txt);
+// ── CSS2D label helper ────────────────────────────────────────────────────────
+function makeLabel(text, color, cssClass) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  div.className = cssClass || 'node-label';
+  div.style.color = color;
+  return new CSS2DObject(div);
+}
 
-    const txt2 = el('text',{x:CX,y:CY+r+14,fill: alt ? 'rgba(0,229,255,0.85)' : 'rgba(255,255,255,0.65)',
-      'font-family':'Share Tech Mono,monospace','font-size':'11',
-      'text-anchor':'middle','font-weight': alt ? 'bold' : 'normal'});
-    txt2.textContent = RING_NAMES[i];
-    lyrRings.appendChild(txt2);
+// ── Build dartboard disc & rings ──────────────────────────────────────────────
+function buildDartboard() {
+  // Base disc
+  const discGeo = new THREE.CircleGeometry(WORLD_R * 0.95, 96);
+  discGeo.rotateX(-Math.PI / 2);
+  const discMat = new THREE.MeshStandardMaterial({
+    color: 0x0a1520, transparent: true, opacity: 0.85, roughness: 0.9
+  });
+  scene.add(new THREE.Mesh(discGeo, discMat));
+
+  // Subtle filled ring regions
+  for (let i = MAX_RING; i >= 2; i--) {
+    const outerR = WORLD_R * RING_F[i];
+    const innerR = (i > 1) ? WORLD_R * RING_F[i - 1] : 0;
+    const alt = i % 2 === 0;
+    const fillGeo = new THREE.RingGeometry(innerR, outerR, 96);
+    fillGeo.rotateX(-Math.PI / 2);
+    const fillMat = new THREE.MeshBasicMaterial({
+      color: alt ? 0x00e5ff : 0xffffff,
+      transparent: true, opacity: alt ? 0.025 : 0.015, side: THREE.DoubleSide
+    });
+    const fillMesh = new THREE.Mesh(fillGeo, fillMat);
+    fillMesh.position.y = 0.005;
+    scene.add(fillMesh);
   }
 
-  const r0 = R * RING_F[1] * 0.55;
-  lyrRings.appendChild(el('circle',{cx:CX,cy:CY,r:r0,
-    fill:'rgba(105,255,71,0.04)',stroke:'rgba(105,255,71,0.55)',
-    'stroke-width':'1','stroke-dasharray':'4 6'}));
-  const td = el('text',{x:CX,y:CY-r0-5,fill:'rgba(105,255,71,0.9)',
-    'font-family':'Share Tech Mono,monospace','font-size':'11',
-    'text-anchor':'middle','font-weight':'bold'});
-  td.textContent = 'Direct';
-  lyrRings.appendChild(td);
+  // Ring outlines
+  for (let i = 1; i <= MAX_RING; i++) {
+    const r = WORLD_R * RING_F[i];
+    const alt = i % 2 === 0;
+    const ringLine = createRingLine(r,
+      alt ? 0x00e5ff : 0xffffff,
+      alt ? 0.45 : 0.30,
+      alt ? 0.35 : 0.12,
+      alt ? 0.45 : 0.55
+    );
+    ringLine.position.y = 0.01;
+    scene.add(ringLine);
 
-  for (let p=0;p<2;p++) {
-    const pr = el('circle',{cx:CX,cy:CY,r:14,fill:'none',
-      stroke:'rgba(255,255,255,0.7)','stroke-width':'1.5'});
-    const at = el('animateTransform',{attributeName:'transform',type:'scale',
-      from:'1 1 '+CX+' '+CY,to:'3.8 3.8 '+CX+' '+CY,
-      dur:'3s',begin:(p*1.5)+'s',repeatCount:'indefinite'});
-    const ao = el('animate',{attributeName:'opacity',from:'0.6',to:'0',
-      dur:'3s',begin:(p*1.5)+'s',repeatCount:'indefinite'});
-    pr.appendChild(at); pr.appendChild(ao);
-    lyrRings.appendChild(pr);
+    // Top label (along +Z)
+    const topLabel = makeLabel(RING_NAMES[i],
+      alt ? 'rgba(0,229,255,0.85)' : 'rgba(255,255,255,0.65)', 'ring-label');
+    topLabel.element.style.fontWeight = alt ? 'bold' : 'normal';
+    topLabel.position.set(0, 0.02, -r - 0.4);
+    scene.add(topLabel);
+
+    // Bottom label (along -Z)
+    const botLabel = makeLabel(RING_NAMES[i],
+      alt ? 'rgba(0,229,255,0.85)' : 'rgba(255,255,255,0.65)', 'ring-label');
+    botLabel.element.style.fontWeight = alt ? 'bold' : 'normal';
+    botLabel.position.set(0, 0.02, r + 0.4);
+    scene.add(botLabel);
   }
-  lyrRings.appendChild(el('circle',{cx:CX,cy:CY,r:8,fill:'#fff',
-    filter:'url(#glow-ctr)'}));
-  const cl = el('text',{x:CX,y:CY+23,fill:'rgba(255,255,255,0.7)',
-    'font-family':'Share Tech Mono,monospace','font-size':'11','text-anchor':'middle'});
-  cl.textContent = 'vm150';
-  lyrRings.appendChild(cl);
+
+  // Direct ring
+  const directR = WORLD_R * RING_F[1] * 0.55;
+  const directLine = createRingLine(directR, 0x69ff47, 0.55, 0.25, 0.35);
+  directLine.position.y = 0.01;
+  scene.add(directLine);
+  const directLabel = makeLabel('Direct', 'rgba(105,255,71,0.9)', 'ring-label');
+  directLabel.element.style.fontWeight = 'bold';
+  directLabel.position.set(0, 0.02, -directR - 0.4);
+  scene.add(directLabel);
+
+  // Center node sphere
+  const centerMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.6
+  });
+  const centerMesh = new THREE.Mesh(new THREE.SphereGeometry(0.35, 32, 24), centerMat);
+  centerMesh.position.set(0, CENTER_Y, 0);
+  scene.add(centerMesh);
+
+  // Center glow
+  const centerGlowMat = new THREE.MeshBasicMaterial({
+    color: 0xffffff, transparent: true, opacity: 0.12,
+    blending: THREE.AdditiveBlending
+  });
+  const centerGlow = new THREE.Mesh(new THREE.SphereGeometry(0.6, 32, 24), centerGlowMat);
+  centerGlow.position.set(0, CENTER_Y, 0);
+  scene.add(centerGlow);
+
+  // Center point light
+  const centerLight = new THREE.PointLight(0xffffff, 3, 8);
+  centerLight.position.set(0, 1.5, 0);
+  scene.add(centerLight);
+
+  // Center label
+  const cLabel = makeLabel('vm150', 'rgba(255,255,255,0.7)', 'ring-label');
+  cLabel.position.set(0, CENTER_Y - 0.6, 0);
+  scene.add(cLabel);
+
+  // Animated center pulse rings
+  for (let p = 0; p < 2; p++) {
+    const pulseLine = createRingLine(1, 0xffffff, 0.6, 999, 0);
+    pulseLine.position.y = CENTER_Y;
+    pulseLine.userData = { phaseOffset: p * 1.5, cycleDur: 3.0 };
+    scene.add(pulseLine);
+    centerPulseRings.push(pulseLine);
+  }
+}
+
+function createRingLine(radius, color, opacity, dashSize, gapSize) {
+  const segments = 128;
+  const points = [];
+  for (let i = 0; i <= segments; i++) {
+    const theta = (i / segments) * Math.PI * 2;
+    points.push(new THREE.Vector3(radius * Math.cos(theta), 0, radius * Math.sin(theta)));
+  }
+  const geo = new THREE.BufferGeometry().setFromPoints(points);
+  let mat;
+  if (gapSize > 0 && dashSize < 900) {
+    mat = new THREE.LineDashedMaterial({
+      color, transparent: true, opacity, dashSize, gapSize
+    });
+  } else {
+    mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity });
+  }
+  const line = new THREE.Line(geo, mat);
+  line.computeLineDistances();
+  return line;
 }
 
 // ── Node positioning ──────────────────────────────────────────────────────────
 function ringR(hops) {
-  const ring = Math.min(Math.max(hops,0), MAX_RING);
-  if (ring === 0) return R * RING_F[1] * 0.55;
-  return R * RING_F[ring];
+  const ring = Math.min(Math.max(hops, 0), MAX_RING);
+  if (ring === 0) return WORLD_R * RING_F[1] * 0.55;
+  return WORLD_R * RING_F[ring];
 }
 
 function assignAngles() {
   const rings = {};
-  for (const [h,n] of Object.entries(nodes)) {
-    const ring = Math.min(Math.max(n.hops,0), MAX_RING);
+  for (const [h, n] of Object.entries(nodes)) {
+    const ring = Math.min(Math.max(n.hops, 0), MAX_RING);
     if (!rings[ring]) rings[ring] = [];
     rings[ring].push(h);
   }
-  for (const [ring,hashes] of Object.entries(rings)) {
+  for (const [ring, hashes] of Object.entries(rings)) {
     const sorted = hashes.slice().sort();
-    sorted.forEach((h,i) => {
+    sorted.forEach((h, i) => {
       const offset = (parseInt(ring) % 2 === 0) ? Math.PI / sorted.length : 0;
-      nodes[h]._angle = offset + (i / sorted.length) * 2 * Math.PI - Math.PI/2;
+      nodes[h]._angle = offset + (i / sorted.length) * 2 * Math.PI - Math.PI / 2;
       nodes[h]._ring  = parseInt(ring);
     });
   }
 }
 
-function nodeXY(n) {
+function nodePos(n) {
   const r = ringR(n.hops);
-  return [CX + r*Math.cos(n._angle||0), CY + r*Math.sin(n._angle||0)];
+  const a = n._angle || 0;
+  return [r * Math.cos(a), r * Math.sin(a)];
 }
 
-// ── Draw nodes ────────────────────────────────────────────────────────────────
-function drawNodes() {
-  while (lyrNodes.firstChild)  lyrNodes.removeChild(lyrNodes.firstChild);
-  while (lyrLabels.firstChild) lyrLabels.removeChild(lyrLabels.firstChild);
-
-  let defs = svg.querySelector('defs');
-  Array.from(defs.querySelectorAll('filter[id^="gf-"]')).forEach(f=>f.remove());
-
+// ── Node rendering ────────────────────────────────────────────────────────────
+function updateNodes() {
   assignAngles();
+  const activeHashes = new Set();
 
-  for (const [h,n] of Object.entries(nodes)) {
-    if (!filterOn[n.app_type]) continue;
-    const [x,y] = nodeXY(n);
-    const color = COL[n.app_type] || '#607d8b';
+  for (const [h, n] of Object.entries(nodes)) {
+    activeHashes.add(h);
+    const visible = !!filterOn[n.app_type];
+    const [x, z] = nodePos(n);
+    const colorStr = COL[n.app_type] || '#607d8b';
 
-    const fid = 'gf-'+h.substring(0,8);
-    const filt = el('filter',{id:fid,x:'-150%',y:'-150%',width:'400%',height:'400%'});
-    const blur = el('feGaussianBlur',{in:'SourceGraphic',stdDeviation:'4',result:'b'});
-    const mrg  = el('feMerge',{});
-    mrg.appendChild(el('feMergeNode',{in:'b'}));
-    mrg.appendChild(el('feMergeNode',{in:'SourceGraphic'}));
-    filt.appendChild(blur); filt.appendChild(mrg);
-    defs.appendChild(filt);
+    if (nodeMeshes.has(h)) {
+      const obj = nodeMeshes.get(h);
+      obj.mesh.position.set(x, FLOAT_Y, z);
+      obj.glow.position.set(x, FLOAT_Y, z);
+      obj.label.position.set(x, FLOAT_Y - 0.45, z);
+      obj.mesh.visible = visible;
+      obj.glow.visible = visible;
+      obj.label.visible = visible;
+    } else {
+      const color = new THREE.Color(colorStr);
 
-    const dot = el('circle',{cx:x,cy:y,r:5,fill:color,
-      filter:'url(#'+fid+')',style:'cursor:pointer'});
-    dot.addEventListener('mouseenter', e => showTip(n,e.clientX,e.clientY));
-    dot.addEventListener('mouseleave', hideTip);
-    dot.addEventListener('mousemove',  e => moveTip(e.clientX,e.clientY));
-    lyrNodes.appendChild(dot);
+      const mat = new THREE.MeshStandardMaterial({
+        color, emissive: color, emissiveIntensity: 0.5
+      });
+      const mesh = new THREE.Mesh(nodeGeo, mat);
+      mesh.position.set(x, FLOAT_Y, z);
+      mesh.visible = visible;
+      mesh.userData = { hash: h };
+      scene.add(mesh);
+      nodeGroup.push(mesh);
 
-    const lbl = el('text',{x:x,y:y+15,
-      fill:color.replace('ff','99').replace('FF','99'),
-      'font-family':'Share Tech Mono,monospace','font-size':'8.5',
-      'text-anchor':'middle',style:'pointer-events:none',
-      'paint-order':'stroke','stroke':'#04080f','stroke-width':'3'});
-    lbl.textContent = n.name.substring(0,16);
-    lyrLabels.appendChild(lbl);
+      const glowMat = new THREE.MeshBasicMaterial({
+        color, transparent: true, opacity: 0.15,
+        blending: THREE.AdditiveBlending
+      });
+      const glow = new THREE.Mesh(glowGeo, glowMat);
+      glow.position.set(x, FLOAT_Y, z);
+      glow.visible = visible;
+      scene.add(glow);
+
+      const label = makeLabel(n.name.substring(0, 16), colorStr);
+      label.position.set(x, FLOAT_Y - 0.45, z);
+      label.visible = visible;
+      scene.add(label);
+
+      nodeMeshes.set(h, { mesh, glow, label, mat, glowMat });
+    }
+  }
+
+  // Remove stale nodes
+  for (const [h, obj] of nodeMeshes) {
+    if (!activeHashes.has(h)) {
+      scene.remove(obj.mesh);
+      scene.remove(obj.glow);
+      scene.remove(obj.label);
+      obj.mat.dispose();
+      obj.glowMat.dispose();
+      const idx = nodeGroup.indexOf(obj.mesh);
+      if (idx >= 0) nodeGroup.splice(idx, 1);
+      nodeMeshes.delete(h);
+    }
   }
 }
 
+function redraw() { updateNodes(); }
+
+// ── Comet trail shader material (shared) ─────────────────────────────────────
+const trailVertShader = `
+  attribute float size;
+  attribute float alpha;
+  varying float vAlpha;
+  void main() {
+    vAlpha = alpha;
+    vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+    gl_PointSize = size * (300.0 / -mvPos.z);
+    gl_Position = projectionMatrix * mvPos;
+  }
+`;
+const trailFragShader = `
+  uniform vec3 color;
+  varying float vAlpha;
+  void main() {
+    float d = length(gl_PointCoord - vec2(0.5));
+    if (d > 0.5) discard;
+    float soft = 1.0 - smoothstep(0.15, 0.5, d);
+    gl_FragColor = vec4(color, vAlpha * soft);
+  }
+`;
+const TRAIL_LEN = 14;
+
 // ── Packet animations ─────────────────────────────────────────────────────────
-function animPacket(fromX, fromY, toX, toY, color) {
-  const lines = [
-    {w:8, op:0.05},
-    {w:2.5,op:0.22},
-    {w:1,  op:0.8},
-  ].map(s => {
-    const l = el('line',{x1:fromX,y1:fromY,x2:toX,y2:toY,
-      stroke:color,'stroke-width':s.w,opacity:s.op,'stroke-linecap':'round'});
-    lyrAnims.appendChild(l);
-    return {e:l, base:s.op};
+function animPacket3D(x1, y1, z1, x2, y2, z2, colorStr) {
+  const color = new THREE.Color(colorStr);
+
+  const lineGeo = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(x1, y1, z1),
+    new THREE.Vector3(x1, y1, z1)
+  ]);
+  const lineMat = new THREE.LineBasicMaterial({
+    color, transparent: true, opacity: 0.4
+  });
+  const line = new THREE.Line(lineGeo, lineMat);
+  scene.add(line);
+
+  // Wide glow line
+  const glowMat = new THREE.LineBasicMaterial({
+    color, transparent: true, opacity: 0.08,
+    blending: THREE.AdditiveBlending
+  });
+  const glowLine = new THREE.Line(lineGeo.clone(), glowMat);
+  scene.add(glowLine);
+
+  const dotMat = new THREE.MeshBasicMaterial({ color });
+  const dot = new THREE.Mesh(dotGeo, dotMat);
+  dot.position.set(x1, y1, z1);
+  scene.add(dot);
+
+  // Comet trail
+  const trailPositions = new Float32Array(TRAIL_LEN * 3);
+  const trailSizes = new Float32Array(TRAIL_LEN);
+  const trailAlphas = new Float32Array(TRAIL_LEN);
+  for (let i = 0; i < TRAIL_LEN; i++) {
+    trailPositions[i * 3]     = x1;
+    trailPositions[i * 3 + 1] = y1;
+    trailPositions[i * 3 + 2] = z1;
+    const f = 1 - i / TRAIL_LEN;
+    trailSizes[i]  = 0.18 * f + 0.02;
+    trailAlphas[i] = 0.7 * f * f;
+  }
+  const trailGeo = new THREE.BufferGeometry();
+  trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+  trailGeo.setAttribute('size',     new THREE.BufferAttribute(trailSizes, 1));
+  trailGeo.setAttribute('alpha',    new THREE.BufferAttribute(trailAlphas, 1));
+  const trailMat = new THREE.ShaderMaterial({
+    uniforms: { color: { value: color } },
+    vertexShader: trailVertShader,
+    fragmentShader: trailFragShader,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  const trail = new THREE.Points(trailGeo, trailMat);
+  scene.add(trail);
+
+  activeAnims.push({
+    type: 'packet', line, glowLine, dot, trail, lineMat, glowMat, dotMat, trailMat, lineGeo, trailGeo,
+    x1, y1, z1, x2, y2, z2,
+    t0: performance.now(), dur: 700 + Math.random() * 400,
+    colorStr, prevEase: 0
+  });
+}
+
+function pulseAt3D(x, y, z, colorStr) {
+  const color = new THREE.Color(colorStr);
+  const pulseLine = createRingLine(1, color, 0.95, 999, 0);
+  pulseLine.position.set(x, y, z);
+  pulseLine.scale.set(0.2, 1, 0.2);
+  scene.add(pulseLine);
+
+  activeAnims.push({
+    type: 'pulse', ring: pulseLine,
+    t0: performance.now(), dur: 500
+  });
+}
+
+function updateAnimations(now) {
+  // Center pulse rings
+  centerPulseRings.forEach(ring => {
+    const ud = ring.userData;
+    const elapsed = (now / 1000 + ud.phaseOffset) % ud.cycleDur;
+    const t = elapsed / ud.cycleDur;
+    const baseScale = 0.6;
+    const maxScale = baseScale * 3.8;
+    const scale = baseScale + t * (maxScale - baseScale);
+    ring.scale.set(scale, 1, scale);
+    ring.material.opacity = 0.6 * (1 - t);
   });
 
-  const dot = el('circle',{cx:fromX,cy:fromY,r:3.5,fill:color,opacity:1});
-  lyrAnims.appendChild(dot);
-
-  const DUR = 700 + Math.random()*400;
-  const t0  = performance.now();
-
-  (function step(now) {
-    const p    = Math.min((now-t0)/DUR, 1);
-    const ease = p<0.5 ? 2*p*p : -1+(4-2*p)*p;
-    dot.setAttribute('cx', fromX+(toX-fromX)*ease);
-    dot.setAttribute('cy', fromY+(toY-fromY)*ease);
-    lines.forEach(l => l.e.setAttribute('opacity', l.base*(1-ease*0.75)));
-    if (p<1) {
-      requestAnimationFrame(step);
-    } else {
-      lines.forEach(l => lyrAnims.removeChild(l.e));
-      lyrAnims.removeChild(dot);
-      pulseAt(toX, toY, color);
-      pulseAt(fromX, fromY, color);
+  // Active animations
+  for (let i = activeAnims.length - 1; i >= 0; i--) {
+    const a = activeAnims[i];
+    if (a.type === 'packet') {
+      const p = Math.min((now - a.t0) / a.dur, 1);
+      const ease = p < 0.5 ? 2 * p * p : -1 + (4 - 2 * p) * p;
+      const cx = a.x1 + (a.x2 - a.x1) * ease;
+      const cy = a.y1 + (a.y2 - a.y1) * ease;
+      const cz = a.z1 + (a.z2 - a.z1) * ease;
+      a.dot.position.set(cx, cy, cz);
+      // Grow line/glow to current packet position
+      const lp = a.lineGeo.attributes.position.array;
+      lp[3] = cx; lp[4] = cy; lp[5] = cz;
+      a.lineGeo.attributes.position.needsUpdate = true;
+      const gp = a.glowLine.geometry.attributes.position.array;
+      gp[3] = cx; gp[4] = cy; gp[5] = cz;
+      a.glowLine.geometry.attributes.position.needsUpdate = true;
+      // Update comet trail: shift positions back then set head
+      const pos = a.trailGeo.attributes.position.array;
+      for (let t = TRAIL_LEN - 1; t > 0; t--) {
+        pos[t * 3]     = pos[(t - 1) * 3];
+        pos[t * 3 + 1] = pos[(t - 1) * 3 + 1];
+        pos[t * 3 + 2] = pos[(t - 1) * 3 + 2];
+      }
+      pos[0] = cx; pos[1] = cy; pos[2] = cz;
+      a.trailGeo.attributes.position.needsUpdate = true;
+      a.lineMat.opacity = 0.4 * (1 - ease * 0.75);
+      a.glowMat.opacity = 0.08 * (1 - ease * 0.75);
+      if (p >= 1) {
+        scene.remove(a.line);
+        scene.remove(a.glowLine);
+        scene.remove(a.dot);
+        scene.remove(a.trail);
+        a.lineGeo.dispose();
+        a.lineMat.dispose();
+        a.glowMat.dispose();
+        a.dotMat.dispose();
+        a.trailGeo.dispose();
+        a.trailMat.dispose();
+        activeAnims.splice(i, 1);
+        pulseAt3D(a.x2, a.y2, a.z2, a.colorStr);
+        pulseAt3D(a.x1, a.y1, a.z1, a.colorStr);
+      }
+    } else if (a.type === 'pulse') {
+      const p = Math.min((now - a.t0) / a.dur, 1);
+      const scale = 0.2 + p * 1.5;
+      a.ring.scale.set(scale, 1, scale);
+      a.ring.material.opacity = 0.95 * (1 - p);
+      if (p >= 1) {
+        scene.remove(a.ring);
+        a.ring.geometry.dispose();
+        a.ring.material.dispose();
+        activeAnims.splice(i, 1);
+      }
     }
-  })(t0);
+  }
 }
 
-function pulseAt(x, y, color) {
-  let r=5, op=0.95;
-  const ring = el('circle',{cx:x,cy:y,r:r,fill:'none',
-    stroke:color,'stroke-width':'2',opacity:op});
-  lyrAnims.appendChild(ring);
-  const id = setInterval(()=>{
-    r+=2.8; op-=0.055;
-    ring.setAttribute('r',r);
-    ring.setAttribute('opacity',Math.max(0,op));
-    if(op<=0){clearInterval(id);lyrAnims.removeChild(ring);}
-  },18);
-}
-
+// ── Ping config & fire ────────────────────────────────────────────────────────
 let pingLevel = 4;
 const PING_CFG = [
-  { toCentre:false, peers:0,  cascade:0   },
-  { toCentre:true,  peers:1,  cascade:0   },
-  { toCentre:true,  peers:3,  cascade:0   },
-  { toCentre:true,  peers:6,  cascade:1   },
-  { toCentre:true,  peers:12, cascade:2   },
+  { toCentre:false, peers:0,  cascade:0 },
+  { toCentre:true,  peers:1,  cascade:0 },
+  { toCentre:true,  peers:3,  cascade:0 },
+  { toCentre:true,  peers:6,  cascade:1 },
+  { toCentre:true,  peers:12, cascade:2 },
 ];
 
 function randPeer(exclude) {
   const pool = Object.values(nodes).filter(p =>
-    p.hash !== (exclude||{}).hash && filterOn[p.app_type] && p._angle !== undefined
+    p.hash !== (exclude || {}).hash && filterOn[p.app_type] && p._angle !== undefined
   );
   if (!pool.length) return null;
-  return pool[Math.floor(Math.random()*pool.length)];
+  return pool[Math.floor(Math.random() * pool.length)];
 }
 
 function fireAnnounce(n) {
@@ -418,26 +691,45 @@ function fireAnnounce(n) {
   if (!cfg || (!cfg.toCentre && cfg.peers === 0)) return;
   const color = COL[n.app_type] || '#607d8b';
   assignAngles();
-  const [fx,fy] = nodeXY(n);
+  const [fx, fz] = nodePos(n);
 
-  if (cfg.toCentre) animPacket(fx, fy, CX, CY, color);
+  if (cfg.toCentre) animPacket3D(fx, FLOAT_Y, fz, 0, CENTER_Y, 0, color);
 
-  for (let i=0; i<cfg.peers; i++) {
+  for (let i = 0; i < cfg.peers; i++) {
     const peer = randPeer(n);
     if (!peer) break;
-    const [px,py] = nodeXY(peer);
-    const delay = 80 + i*60;
-    setTimeout(()=>{
-      animPacket(fx, fy, px, py, color);
-      for (let c=0; c<cfg.cascade; c++) {
+    const [px, pz] = nodePos(peer);
+    const delay = 80 + i * 60;
+    setTimeout(() => {
+      animPacket3D(fx, FLOAT_Y, fz, px, FLOAT_Y, pz, color);
+      for (let c = 0; c < cfg.cascade; c++) {
         const next = randPeer(peer);
         if (!next) break;
-        const [nx,ny] = nodeXY(next);
+        const [nx, nz] = nodePos(next);
         const peerColor = COL[peer.app_type] || '#607d8b';
-        setTimeout(()=>animPacket(px, py, nx, ny, peerColor), 350+c*200);
+        setTimeout(() => animPacket3D(px, FLOAT_Y, pz, nx, FLOAT_Y, nz, peerColor), 350 + c * 200);
       }
     }, delay);
   }
+}
+
+// ── Render loop ───────────────────────────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  updateAnimations(performance.now());
+  renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
+}
+
+// ── Resize ────────────────────────────────────────────────────────────────────
+function onResize() {
+  const W = container.clientWidth, H = container.clientHeight;
+  if (W === 0 || H === 0) return;
+  camera.aspect = W / H;
+  camera.updateProjectionMatrix();
+  renderer.setSize(W, H);
+  labelRenderer.setSize(W, H);
 }
 
 // ── Live feed ─────────────────────────────────────────────────────────────────
@@ -445,126 +737,126 @@ const feedEl = document.getElementById('feed');
 const MAX_FED = 80;
 
 function pushFeed(n, ts) {
-  const color = COL[n.app_type]||'#607d8b';
-  const label = LABEL[n.app_type]||n.app_type;
-  const hstr  = n.hops===0?'direct':n.hops+' hop'+(n.hops!==1?'s':'');
-  const tstr  = new Date(ts*1000).toLocaleTimeString('en-GB',{hour12:false});
+  const color = COL[n.app_type] || '#607d8b';
+  const label = LABEL[n.app_type] || n.app_type;
+  const hstr  = n.hops === 0 ? 'direct' : n.hops + ' hop' + (n.hops !== 1 ? 's' : '');
+  const tstr  = new Date(ts * 1000).toLocaleTimeString('en-GB', { hour12: false });
   const e = document.createElement('div');
-  e.className='fi fresh';
-  e.innerHTML=
-    '<div class="fi-dot" style="background:'+color+';box-shadow:0 0 5px '+color+'"></div>'+
-    '<div class="fi-body">'+
-      '<div class="fi-name">'+esc(n.name)+'</div>'+
-      '<div class="fi-meta">'+
-        '<span class="fi-badge" style="color:'+color+';border-color:'+color+'44">'+label+'</span>'+
-        '<span class="fi-hops">'+hstr+'</span>'+
-        '<span class="fi-time">'+tstr+'</span>'+
-      '</div>'+
+  e.className = 'fi fresh';
+  e.innerHTML =
+    '<div class="fi-dot" style="background:' + color + ';box-shadow:0 0 5px ' + color + '"></div>' +
+    '<div class="fi-body">' +
+      '<div class="fi-name">' + esc(n.name) + '</div>' +
+      '<div class="fi-meta">' +
+        '<span class="fi-badge" style="color:' + color + ';border-color:' + color + '44">' + label + '</span>' +
+        '<span class="fi-hops">' + hstr + '</span>' +
+        '<span class="fi-time">' + tstr + '</span>' +
+      '</div>' +
     '</div>';
   feedEl.prepend(e);
-  setTimeout(()=>e.classList.remove('fresh'),400);
-  while(feedEl.children.length>MAX_FED) feedEl.removeChild(feedEl.lastChild);
+  setTimeout(() => e.classList.remove('fresh'), 400);
+  while (feedEl.children.length > MAX_FED) feedEl.removeChild(feedEl.lastChild);
 }
 
 // ── Tooltip ───────────────────────────────────────────────────────────────────
 const tipEl = document.getElementById('tip');
-function showTip(n,x,y){
-  const color=COL[n.app_type]||'#607d8b';
-  const hstr=n.hops===0?'direct':n.hops+' hop'+(n.hops!==1?'s':'');
-  tipEl.innerHTML=
-    '<div class="tip-name">'+esc(n.name)+'</div>'+
-    '<div class="tip-row"><span>Type</span><span style="color:'+color+'">'+(LABEL[n.app_type]||n.app_type)+'</span></div>'+
-    '<div class="tip-row"><span>Hash</span><span>'+n.hash.substring(0,16)+'…</span></div>'+
-    '<div class="tip-row"><span>Distance</span><span>'+hstr+'</span></div>'+
-    '<div class="tip-row"><span>Last seen</span><span>'+timeAgo(n.last_seen)+'</span></div>';
-  tipEl.style.display='block'; moveTip(x,y);
+function showTip(n, x, y) {
+  const color = COL[n.app_type] || '#607d8b';
+  const hstr = n.hops === 0 ? 'direct' : n.hops + ' hop' + (n.hops !== 1 ? 's' : '');
+  tipEl.innerHTML =
+    '<div class="tip-name">' + esc(n.name) + '</div>' +
+    '<div class="tip-row"><span>Type</span><span style="color:' + color + '">' + (LABEL[n.app_type] || n.app_type) + '</span></div>' +
+    '<div class="tip-row"><span>Hash</span><span>' + n.hash.substring(0, 16) + '…</span></div>' +
+    '<div class="tip-row"><span>Distance</span><span>' + hstr + '</span></div>' +
+    '<div class="tip-row"><span>Last seen</span><span>' + timeAgo(n.last_seen) + '</span></div>';
+  tipEl.style.display = 'block'; moveTip(x, y);
 }
-function hideTip(){tipEl.style.display='none';}
-function moveTip(x,y){
-  const tw=tipEl.offsetWidth,th=tipEl.offsetHeight;
-  tipEl.style.left=(x+tw+22>window.innerWidth?x-tw-14:x+14)+'px';
-  tipEl.style.top=(y+th+10>window.innerHeight?y-th-6:y+4)+'px';
+function hideTip() { tipEl.style.display = 'none'; }
+function moveTip(x, y) {
+  const tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
+  tipEl.style.left = (x + tw + 22 > window.innerWidth ? x - tw - 14 : x + 14) + 'px';
+  tipEl.style.top  = (y + th + 10 > window.innerHeight ? y - th - 6 : y + 4) + 'px';
 }
 
 // ── Filter buttons ────────────────────────────────────────────────────────────
-const typeMap={lxmf:'lxmf',nomad:'nomadnet',prop:'propagation',audio:'audio'};
-document.querySelectorAll('.fbtn').forEach(btn=>{
-  btn.addEventListener('click',()=>{
-    const key=typeMap[btn.dataset.t]; if(!key)return;
-    filterOn[key]=!filterOn[key];
-    btn.classList.toggle('on',filterOn[key]);
-    drawNodes();
+const typeMap = { lxmf:'lxmf', nomad:'nomadnet', prop:'propagation', audio:'audio' };
+document.querySelectorAll('.fbtn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const key = typeMap[btn.dataset.t]; if (!key) return;
+    filterOn[key] = !filterOn[key];
+    btn.classList.toggle('on', filterOn[key]);
+    updateNodes();
   });
 });
 
 // ── Reset button ─────────────────────────────────────────────────────────────
-document.getElementById('reset-btn').addEventListener('click', async ()=>{
+document.getElementById('reset-btn').addEventListener('click', async () => {
   if (!confirm('Reset node database? Activity graph will not be affected.')) return;
-  await fetch('/reset', {method:'POST'});
+  await fetch('/reset', { method: 'POST' });
 });
 
 // ── Ping selector ────────────────────────────────────────────────────────────
-document.querySelectorAll('.pbtn').forEach(btn=>{
-  btn.addEventListener('click',()=>{
-    pingLevel=parseInt(btn.dataset.p);
-    document.querySelectorAll('.pbtn').forEach(b=>b.classList.remove('on'));
+document.querySelectorAll('.pbtn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    pingLevel = parseInt(btn.dataset.p);
+    document.querySelectorAll('.pbtn').forEach(b => b.classList.remove('on'));
     btn.classList.add('on');
   });
 });
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
-const nnEl=document.getElementById('nn'), naEl=document.getElementById('na');
-function updateStats(){nnEl.textContent=Object.keys(nodes).length;naEl.textContent=pktCount;}
-
-// ── Full redraw ───────────────────────────────────────────────────────────────
-function redraw(){initLayers();drawRings();drawNodes();}
+const nnEl = document.getElementById('nn'), naEl = document.getElementById('na');
+function updateStats() { nnEl.textContent = Object.keys(nodes).length; naEl.textContent = pktCount; }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
-const wsDot=document.getElementById('wsdot'),wsLbl=document.getElementById('wslbl');
-let wsRetry=1000;
+const wsDot = document.getElementById('wsdot'), wsLbl = document.getElementById('wslbl');
+let wsRetry = 1000;
 
-function connect(){
-  const proto=location.protocol==='https:'?'wss':'ws';
-  const ws=new WebSocket(proto+'://'+location.host+'/ws');
-  ws.onopen=()=>{wsRetry=1000;wsDot.className='ok';wsLbl.textContent='connected · vm150';};
-  ws.onclose=()=>{wsDot.className='';wsLbl.textContent='reconnecting…';
-    setTimeout(connect,wsRetry=Math.min(wsRetry*1.5,15000));};
-  ws.onerror=()=>{};
-  ws.onmessage=e=>{
-    let msg; try{msg=JSON.parse(e.data);}catch(_){return;}
-    if(msg.type==='state'){
-      nodes={};
-      msg.nodes.forEach(n=>nodes[n.hash]=n);
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(proto + '://' + location.host + '/ws');
+  ws.onopen = () => { wsRetry = 1000; wsDot.className = 'ok'; wsLbl.textContent = 'connected · vm150'; };
+  ws.onclose = () => { wsDot.className = ''; wsLbl.textContent = 'reconnecting…';
+    setTimeout(connect, wsRetry = Math.min(wsRetry * 1.5, 15000)); };
+  ws.onerror = () => {};
+  ws.onmessage = e => {
+    let msg; try { msg = JSON.parse(e.data); } catch (_) { return; }
+    if (msg.type === 'state') {
+      nodes = {};
+      msg.nodes.forEach(n => nodes[n.hash] = n);
       redraw(); updateStats();
       loadActivityFromServer();
-    } else if(msg.type==='reset'){
-      nodes={};
+    } else if (msg.type === 'reset') {
+      nodes = {};
       redraw(); updateStats();
-      document.getElementById('feed').innerHTML='';
-      pktCount=0; updateStats();
-    } else if(msg.type==='announce'){
-      const n=msg.node;
-      nodes[n.hash]=n;
+      document.getElementById('feed').innerHTML = '';
+      pktCount = 0; updateStats();
+    } else if (msg.type === 'announce') {
+      const n = msg.node;
+      nodes[n.hash] = n;
       pktCount++;
       fireAnnounce(n);
-      drawNodes();
-      pushFeed(n,msg.ts);
+      updateNodes();
+      pushFeed(n, msg.ts);
       updateStats();
     }
   };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-function timeAgo(ts){
-  if(!ts)return'-';
-  const s=Math.floor(Date.now()/1000-ts);
-  if(s<5)return'just now';if(s<60)return s+'s ago';
-  if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago';
+function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function timeAgo(ts) {
+  if (!ts) return '-';
+  const s = Math.floor(Date.now() / 1000 - ts);
+  if (s < 5) return 'just now'; if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago'; return Math.floor(s / 3600) + 'h ago';
 }
 
-window.addEventListener('resize',resize);
-resize();
+// ── Init ──────────────────────────────────────────────────────────────────────
+initScene();
+buildDartboard();
+window.addEventListener('resize', onResize);
+animate();
 connect();
 </script>
 </body>
