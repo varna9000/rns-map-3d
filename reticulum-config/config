@@ -1,0 +1,18 @@
+[reticulum]
+  enable_transport = yes
+  share_instance = no
+  loglevel = 2
+
+[interfaces]
+
+  [[RNode LoRa Interface]]
+    type = RNodeInterface
+    interface_enabled = yes
+    port = /dev/ttyUSB0
+    frequency = 869525000
+    bandwidth = 250000
+    txpower = 22
+    spreadingfactor = 10
+    codingrate = 5
+    airtime_limit_long = 10
+    mode = gateway

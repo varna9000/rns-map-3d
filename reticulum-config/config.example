@@ -1,0 +1,38 @@
+# reticulum-config/config.example
+#
+# Copy this file to reticulum-config/config and edit to match your hardware.
+# This config is used by rnsd, which rns-map depends on.
+#
+# share_instance = no means rnsd does NOT expose a local shared-instance socket.
+# rns_map.py connects via RNS.Reticulum() which auto-detects this and attaches
+# to rnsd's transport instance directly.
+#
+# Supported interface types: RNodeInterface, TCPClientInterface, UDPInterface etc.
+# See https://reticulum.network/manual/interfaces.html for full reference.
+
+[reticulum]
+  enable_transport = yes
+  share_instance   = no
+  loglevel         = 2
+
+[interfaces]
+
+  # --- RNode LoRa interface (edit port/frequency to match your hardware) ---
+  [[RNode LoRa Interface]]
+    type               = RNodeInterface
+    interface_enabled  = yes
+    port               = /dev/ttyUSB0      # adjust if your RNode appears elsewhere
+    frequency          = 869525000         # 869.525 MHz (EU ISM band, adjust for your region)
+    bandwidth          = 250000
+    txpower            = 22
+    spreadingfactor    = 10
+    codingrate         = 5
+    airtime_limit_long = 10
+    mode               = gateway
+
+  # --- Optional: TCP bootstrap node for wider mesh connectivity ---
+  # [[TCP Bootstrap]]
+  #   type              = TCPClientInterface
+  #   interface_enabled = yes
+  #   target_host       = <bootstrap-node-hostname-or-ip>
+  #   target_port       = 4242
